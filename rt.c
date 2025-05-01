@@ -44,6 +44,8 @@ enum op_kind {
     OpsOf = 43,
     ConstAt = 44,
 
+    ConstDso = 45,
+
     CustomPushArr = 100,
 };
 
@@ -53,8 +55,9 @@ int op_has_arg(enum op_kind op) {
         case Const:
         case Push:
         case Reach:
-        case System: return 1;
-        default:     return 0;
+        case System:
+        case ConstDso: return 1;
+        default:       return 0;
     }
 }
 
@@ -319,6 +322,14 @@ static void run_op(h6_rt_t* rt, op o) {
             h6_heap_arr_destr(arr);
         } break;
 
+        case ConstDso: {
+            assert(o.arg.uint < rt->resolved_dso_len);
+            char* ptr = &rt->dso_by[rt->resolved_dso_abs_off[o.arg.uint]];
+            heap_arr* arr = read_const(ptr);
+            run_arr(rt, arr);
+            h6_heap_arr_destr(arr);
+        } break;
+
         case Push:
         case CustomPushArr:
         {
@@ -517,6 +528,9 @@ h6_rt_t h6_mk_rt(char* bytecode, h6_rt_syscallback_t opt_syscallback, void* opt_
     rt.bytecode = bytecode;
     rt.syscall = opt_syscallback;
     rt.syscall_userptr = opt_syscallback_userptr;
+    rt.dso_by = NULL;
+    rt.resolved_dso_len = 0;
+    rt.resolved_dso_abs_off = NULL;
     return rt;
 }
 
@@ -553,4 +567,49 @@ h6_op* h6_heap_arr_get_op(h6_heap_arr* arr, size_t idx) {
     assert(idx < arr->items_len);
     assert(arr->rc);
     return &arr->items[idx];
+}
+
+void h6_set_dso(h6_rt_t* rt, char* /** MOVED */ dso_bytecode) {
+    assert(!rt->dso_by);
+    rt->dso_by = dso_bytecode;
+
+    size_t ex_header_off = *(uint32_t*) &rt->bytecode[12];
+    if (!ex_header_off)
+        return;
+
+    char* ex_header = &rt->bytecode[ex_header_off];
+
+    size_t ex_header_len = *(uint16_t*) &ex_header[0];
+    size_t num_dso_ent = *(uint32_t*) &ex_header[2];
+
+    uint32_t* dso_tab = (uint32_t*) &ex_header[ex_header_len];
+
+    rt->resolved_dso_len = num_dso_ent;
+    rt->resolved_dso_abs_off = malloc(sizeof(uint32_t) * num_dso_ent);
+
+    struct global_kv {
+        uint32_t name;
+        uint32_t value;
+    } __attribute__((packed));
+
+    uint16_t dso_globals_nent = *(uint16_t*) &dso_bytecode[6];
+    struct global_kv* globals = (struct global_kv*) &dso_bytecode[16 + *(uint32_t*) &dso_bytecode[8]];
+
+    for (size_t i = 0; i < num_dso_ent; i ++) {
+        char* name = &rt->bytecode[16 + dso_tab[i]];
+
+        int found = 0;
+        for (uint16_t g = 0; g < dso_globals_nent; g ++) {
+            char* gname = &dso_bytecode[16 + globals[g].name];
+            if (!strcmp(name, gname)) {
+                rt->resolved_dso_abs_off[i] = 16 + globals[g].value;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            fprintf(stderr, "dso not found: %s\n", name);
+            exit(1);
+        }
+    }
 }
